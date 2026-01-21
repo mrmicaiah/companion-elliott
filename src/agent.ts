@@ -1,18 +1,31 @@
 // ============================================================
 // ELLIOTT SAYER - Agent (Durable Object)
-// Version: 1.0.1 - Fixed SQL queries
+// Version: 2.0.0 - Session-aware memory + 45min timeout
+// Changes:
+// - Session timeout reduced to 45 minutes (was 2 hours)
+// - Message history now scoped to current session only
+// - R2 memory system integration with extraction
+// - Recent conversation summaries available for reference
 // ============================================================
 
 import Anthropic from '@anthropic-ai/sdk';
-import { SYSTEM_PROMPT, CHARACTER_INFO, getContextualPrompt, getWelcomePrompt } from './personality';
+import { buildPrompt, CHARACTER_INFO } from './personality';
+import {
+  initializeUserMemory,
+  loadHotMemory,
+  formatMemoryForPrompt,
+  HotMemory
+} from './memory';
+import { runExtractions } from './extraction';
 
 interface Env {
   MEMORY: R2Bucket;
   ANTHROPIC_API_KEY: string;
   TELEGRAM_BOT_TOKEN: string;
+  ACCOUNTS_URL?: string;
 }
 
-type UserStatus = 'new' | 'trial' | 'hooked' | 'active' | 'paused' | 'churned';
+type UserStatus = 'new' | 'trial' | 'awaiting_email' | 'pending_payment' | 'active' | 'paused' | 'churned';
 
 interface User {
   chat_id: string;
@@ -21,6 +34,8 @@ interface User {
   last_name?: string;
   username?: string;
   status: UserStatus;
+  email?: string;
+  account_id?: string;
   message_count: number;
   trial_messages_remaining: number;
   created_at: string;
@@ -37,9 +52,15 @@ interface Session {
   ended_at?: string;
   summary?: string;
   message_count: number;
+  extraction_done?: number;
 }
 
 const TRIAL_MESSAGE_LIMIT = 25;
+const SESSION_TIMEOUT_MS = 45 * 60 * 1000; // 45 minutes
+const EXTRACTION_DELAY_MS = 15 * 60 * 1000; // 15 minutes of silence
+const CHARACTER_NAME = 'elliott';
+
+const EMAIL_REGEX = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
 
 export class ElliottAgent {
   private state: DurableObjectState;
@@ -62,6 +83,8 @@ export class ElliottAgent {
         last_name TEXT,
         username TEXT,
         status TEXT DEFAULT 'new',
+        email TEXT,
+        account_id TEXT,
         message_count INTEGER DEFAULT 0,
         trial_messages_remaining INTEGER DEFAULT ${TRIAL_MESSAGE_LIMIT},
         created_at TEXT,
@@ -86,7 +109,8 @@ export class ElliottAgent {
         started_at TEXT NOT NULL,
         ended_at TEXT,
         summary TEXT,
-        message_count INTEGER DEFAULT 0
+        message_count INTEGER DEFAULT 0,
+        extraction_done INTEGER DEFAULT 0
       );
       
       CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id);
@@ -113,8 +137,32 @@ export class ElliottAgent {
         return new Response('OK');
       }
       
+      if (url.pathname === '/billing/activate' && request.method === 'POST') {
+        const data = await request.json() as { chat_id: string; account_id: string; email: string };
+        await this.activateUser(data.chat_id, data.account_id, data.email);
+        return this.jsonResponse({ success: true });
+      }
+      
+      if (url.pathname.startsWith('/billing/status/')) {
+        const chatId = url.pathname.split('/').pop();
+        const userResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
+        if (userResult.length === 0) return this.jsonResponse({ error: 'User not found' }, 404);
+        const user = userResult[0] as User;
+        return this.jsonResponse({ 
+          status: user.status, 
+          email: user.email,
+          account_id: user.account_id,
+          trial_remaining: user.trial_messages_remaining
+        });
+      }
+      
       if (url.pathname === '/rhythm/checkAllUsers') {
         await this.checkAllUsersForOutreach();
+        return new Response('OK');
+      }
+      
+      if (url.pathname === '/rhythm/processExtractions') {
+        await this.processStaleExtractions();
         return new Response('OK');
       }
       
@@ -133,11 +181,10 @@ export class ElliottAgent {
         const userResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
         if (userResult.length === 0) return this.jsonResponse({ error: 'User not found' }, 404);
         const user = userResult[0];
-        
         const sessions = this.sql.exec(`SELECT * FROM sessions WHERE chat_id = ? ORDER BY started_at DESC LIMIT 10`, chatId).toArray();
         const recentMessages = this.sql.exec(`SELECT * FROM messages WHERE chat_id = ? ORDER BY timestamp DESC LIMIT 20`, chatId).toArray();
-        
-        return this.jsonResponse({ user, sessions, recentMessages });
+        const memory = await loadHotMemory(this.env.MEMORY, chatId as string);
+        return this.jsonResponse({ user, sessions, recentMessages, memory });
       }
       
       if (url.pathname === '/debug/stats') {
@@ -145,13 +192,35 @@ export class ElliottAgent {
         const messageCount = this.sql.exec(`SELECT COUNT(*) as count FROM messages`).toArray()[0];
         const sessionCount = this.sql.exec(`SELECT COUNT(*) as count FROM sessions`).toArray()[0];
         const statusBreakdown = this.sql.exec(`SELECT status, COUNT(*) as count FROM users GROUP BY status`).toArray();
-        
         return this.jsonResponse({
           users: userCount?.count || 0,
           messages: messageCount?.count || 0,
           sessions: sessionCount?.count || 0,
           byStatus: statusBreakdown
         });
+      }
+      
+      if (url.pathname === '/debug/test-r2') {
+        try {
+          const testKey = `test/connection_${Date.now()}.json`;
+          await this.env.MEMORY.put(testKey, JSON.stringify({ test: true, timestamp: new Date().toISOString() }));
+          const result = await this.env.MEMORY.get(testKey);
+          const data = result ? await result.json() : null;
+          await this.env.MEMORY.delete(testKey);
+          return this.jsonResponse({ success: true, wrote: true, read: data });
+        } catch (e) {
+          return this.jsonResponse({ success: false, error: String(e) }, 500);
+        }
+      }
+      
+      if (url.pathname.startsWith('/debug/init-memory/')) {
+        const chatId = url.pathname.split('/').pop();
+        const userResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
+        if (userResult.length === 0) return this.jsonResponse({ error: 'User not found' }, 404);
+        const user = userResult[0] as User;
+        await initializeUserMemory(this.env.MEMORY, chatId!, user.first_name);
+        const memory = await loadHotMemory(this.env.MEMORY, chatId!);
+        return this.jsonResponse({ success: true, initialized: true, memory });
       }
       
       return new Response('Not found', { status: 404 });
@@ -186,60 +255,143 @@ export class ElliottAgent {
       user = newUserResult[0] as User;
     }
     
+    // Always ensure R2 memory exists
+    await initializeUserMemory(this.env.MEMORY, chatId, user.first_name);
+    
     if (content === '__START__') {
       await this.sendWelcomeMessage(user, isFirstTimeUser);
       return;
     }
     
-    if (user.status === 'trial' && user.trial_messages_remaining <= 0) {
-      await this.sendMessage(chatId, 
-        `Hey ${user.first_name}. You've used your free messages. To keep the conversation going, you'd need to upgrade. [Link coming soon]`
-      );
+    // Magic link flow
+    if (user.status === 'awaiting_email') {
+      const trimmedContent = content.trim().toLowerCase();
+      if (EMAIL_REGEX.test(trimmedContent)) {
+        await this.handleEmailSubmission(user, trimmedContent);
+        return;
+      } else {
+        await this.sendMessage(chatId, `hmm that doesn't look like an email address. just type your email and i'll send you a link to get set up.`);
+        return;
+      }
+    }
+    
+    if (user.status === 'pending_payment') {
+      const trimmedContent = content.trim().toLowerCase();
+      if (EMAIL_REGEX.test(trimmedContent)) {
+        await this.handleEmailSubmission(user, trimmedContent);
+        return;
+      }
+      await this.sendMessage(chatId, `i already sent you a magic link. check your inbox at ${user.email}. if you can't find it, type your email again and i'll send a new one.`);
       return;
     }
     
+    // Trial limit check
+    if (user.status === 'trial' && user.trial_messages_remaining <= 0) {
+      this.sql.exec(`UPDATE users SET status = 'awaiting_email' WHERE chat_id = ?`, chatId);
+      await this.sendMessage(chatId, `hey ${user.first_name}. i've enjoyed getting to know you. to keep chatting, i just need your email so we can get you set up. what's a good email for you?`);
+      return;
+    }
+    
+    // Session management - 45 minute timeout
     const lastSessionResult = this.sql.exec(`SELECT * FROM sessions WHERE chat_id = ? ORDER BY started_at DESC LIMIT 1`, chatId).toArray();
     const lastSession = lastSessionResult.length > 0 ? lastSessionResult[0] as Session : null;
     
-    const needsNewSession = !lastSession || 
-      (now.getTime() - new Date(lastSession.started_at).getTime() > 2 * 60 * 60 * 1000);
+    const lastMessageTime = lastSession ? new Date(lastSession.started_at).getTime() : 0;
+    const timeSinceLastSession = now.getTime() - lastMessageTime;
+    const needsNewSession = !lastSession || timeSinceLastSession > SESSION_TIMEOUT_MS;
     
     let sessionId: string;
+    let isNewSession = false;
     
     if (needsNewSession) {
       if (lastSession && !lastSession.ended_at) {
-        await this.closeSession(lastSession.id, chatId);
+        await this.closeSession(lastSession.id, chatId, lastSession.message_count);
       }
-      
       sessionId = `${chatId}_${Date.now()}`;
       this.sql.exec(`INSERT INTO sessions (id, chat_id, started_at, message_count) VALUES (?, ?, ?, 0)`, sessionId, chatId, now.toISOString());
+      isNewSession = true;
     } else {
       sessionId = lastSession!.id;
     }
     
+    // Store user message
     this.sql.exec(`INSERT INTO messages (chat_id, session_id, role, content, timestamp) VALUES (?, ?, 'user', ?, ?)`, chatId, sessionId, content, now.toISOString());
-    
     this.sql.exec(`UPDATE sessions SET message_count = message_count + 1 WHERE id = ?`, sessionId);
-    this.sql.exec(`UPDATE users SET message_count = message_count + 1, trial_messages_remaining = trial_messages_remaining - 1, last_message_at = ? WHERE chat_id = ?`, now.toISOString(), chatId);
     
-    const response = await this.generateResponse(chatId, sessionId, user);
+    // Update user stats
+    if (user.status === 'trial') {
+      this.sql.exec(`UPDATE users SET message_count = message_count + 1, trial_messages_remaining = trial_messages_remaining - 1, last_message_at = ? WHERE chat_id = ?`, now.toISOString(), chatId);
+    } else {
+      this.sql.exec(`UPDATE users SET message_count = message_count + 1, last_message_at = ? WHERE chat_id = ?`, now.toISOString(), chatId);
+    }
     
+    // Generate response with session-scoped messages
+    const response = await this.generateResponse(chatId, sessionId, user, isNewSession);
+    
+    // Store assistant response
     this.sql.exec(`INSERT INTO messages (chat_id, session_id, role, content, timestamp) VALUES (?, ?, 'assistant', ?, ?)`, chatId, sessionId, response, new Date().toISOString());
     this.sql.exec(`UPDATE sessions SET message_count = message_count + 1 WHERE id = ?`, sessionId);
     
     await this.sendMessage(chatId, response);
-    this.updateUserStatus(chatId);
+  }
+
+  private async handleEmailSubmission(user: User, email: string): Promise<void> {
+    if (!this.env.ACCOUNTS_URL) {
+      this.sql.exec(`UPDATE users SET status = 'pending_payment', email = ? WHERE chat_id = ?`, email, user.chat_id);
+      await this.sendMessage(user.chat_id, `got it. ${email}. billing system coming soon - for now, keep chatting.`);
+      return;
+    }
+    
+    try {
+      const response = await fetch(`${this.env.ACCOUNTS_URL}/link/initiate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, chatId: user.chat_id, character: CHARACTER_NAME, firstName: user.first_name })
+      });
+      const result = await response.json() as { success: boolean; message: string };
+      
+      if (result.success) {
+        this.sql.exec(`UPDATE users SET status = 'pending_payment', email = ? WHERE chat_id = ?`, email, user.chat_id);
+        await this.sendMessage(user.chat_id, `sent you a magic link to ${email}. click it to pick your plan and we can keep this going. check your spam folder if you don't see it in a minute.`);
+      } else {
+        await this.sendMessage(user.chat_id, `something went wrong sending that email. can you double-check the address and try again?`);
+      }
+    } catch (error) {
+      console.error('Magic link initiation error:', error);
+      await this.sendMessage(user.chat_id, `something went wrong on my end. can you try again in a sec?`);
+    }
+  }
+
+  private async activateUser(chatId: string, accountId: string, email: string): Promise<void> {
+    this.sql.exec(`UPDATE users SET status = 'active', account_id = ?, email = ? WHERE chat_id = ?`, accountId, email, chatId);
+    const userResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
+    if (userResult.length > 0) {
+      const user = userResult[0] as User;
+      await this.sendMessage(chatId, `you're all set ${user.first_name}. unlimited chats unlocked. so... where were we?`);
+    }
   }
 
   private async sendWelcomeMessage(user: User, isFirstTime: boolean): Promise<void> {
     const anthropic = new Anthropic({ apiKey: this.env.ANTHROPIC_API_KEY });
-    const welcomePrompt = getWelcomePrompt(user.first_name, isFirstTime);
+    const memory = await loadHotMemory(this.env.MEMORY, user.chat_id);
+    const memoryContext = formatMemoryForPrompt(memory);
+    
+    let welcomeContext: string;
+    if (user.status === 'active') {
+      welcomeContext = `\n\n[CONTEXT: ${user.first_name} is a paying subscriber coming back. Be warm.]`;
+    } else if (isFirstTime) {
+      welcomeContext = `\n\n[CONTEXT: ${user.first_name} just started chatting for the first time. Introduce yourself naturally. They have ${TRIAL_MESSAGE_LIMIT} free messages.]`;
+    } else {
+      welcomeContext = `\n\n[CONTEXT: ${user.first_name} is back. You've talked before. Be casual.]`;
+    }
+    
+    const systemPrompt = buildPrompt('[new conversation starting]', new Date(), memory.relationship.phase) + memoryContext + welcomeContext;
     
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 300,
-      system: SYSTEM_PROMPT + `\n\n${welcomePrompt}`,
-      messages: [{ role: 'user', content: '[SYSTEM: User just started a chat. Send your opening message.]' }]
+      system: systemPrompt,
+      messages: [{ role: 'user', content: '[Send your opening message]' }]
     });
     
     const textBlock = response.content.find(b => b.type === 'text');
@@ -248,25 +400,36 @@ export class ElliottAgent {
     }
   }
 
-  private async generateResponse(chatId: string, sessionId: string, user: User): Promise<string> {
+  private async generateResponse(chatId: string, sessionId: string, user: User, isNewSession: boolean): Promise<string> {
     const anthropic = new Anthropic({ apiKey: this.env.ANTHROPIC_API_KEY });
     
-    const recentMessages = this.sql.exec(`SELECT role, content FROM messages WHERE chat_id = ? ORDER BY timestamp DESC LIMIT 20`, chatId).toArray().reverse();
+    // KEY: Only load messages from CURRENT session
+    const recentMessages = this.sql.exec(
+      `SELECT role, content FROM messages WHERE session_id = ? ORDER BY timestamp ASC`, 
+      sessionId
+    ).toArray();
     
-    const previousSessions = this.sql.exec(`SELECT * FROM sessions WHERE chat_id = ? AND id != ? AND summary IS NOT NULL ORDER BY started_at DESC LIMIT 5`, chatId, sessionId).toArray() as Session[];
+    const lastUserMessage = recentMessages.filter(m => m.role === 'user').pop();
+    const messageContent = lastUserMessage?.content as string || '';
     
-    const sessionList = previousSessions.map(s => `- ${s.started_at}: ${s.summary}`).join('\n');
+    // Load memory (includes recent conversation summaries)
+    const memory = await loadHotMemory(this.env.MEMORY, chatId);
+    const memoryContext = formatMemoryForPrompt(memory);
     
-    const contextPrompt = getContextualPrompt({
-      currentTime: new Date(),
-      isNewSession: recentMessages.length <= 2,
-      previousSessionSummary: previousSessions[0]?.summary,
-      sessionList: sessionList || undefined
-    });
+    let trialContext = '';
+    if (user.status === 'trial') {
+      const remaining = user.trial_messages_remaining - 1;
+      if (remaining <= 5 && remaining > 0) {
+        trialContext = `\n\n[SYSTEM NOTE: User has ${remaining} free messages remaining. Don't mention this unless natural.]`;
+      }
+    }
     
-    const userContext = `\n## USER INFO\nName: ${user.first_name}${user.last_name ? ' ' + user.last_name : ''}\nMessages exchanged: ${user.message_count}\n`;
+    let sessionContext = '';
+    if (isNewSession && recentMessages.length === 1) {
+      sessionContext = `\n\n[This is a fresh conversation. You remember who they are from your memory, but you don't remember the details of what you were chatting about before. If they reference something specific, check your past conversation summaries.]`;
+    }
     
-    const systemPrompt = SYSTEM_PROMPT + userContext + contextPrompt;
+    const systemPrompt = buildPrompt(messageContent, new Date(), memory.relationship.phase) + memoryContext + trialContext + sessionContext;
     
     const messages = recentMessages.map(m => ({
       role: m.role as 'user' | 'assistant',
@@ -293,41 +456,58 @@ export class ElliottAgent {
         body: JSON.stringify({ chat_id: chatId, text: content })
       }
     );
-    
     if (!response.ok) {
       console.error('Telegram error:', await response.text());
     }
   }
 
-  private updateUserStatus(chatId: string): void {
-    const userResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
-    if (userResult.length === 0) return;
-    const user = userResult[0] as User;
+  private async closeSession(sessionId: string, chatId: string, messageCount: number): Promise<void> {
+    const now = new Date().toISOString();
+    this.sql.exec(`UPDATE sessions SET ended_at = ? WHERE id = ?`, now, sessionId);
     
-    if (user.status === 'trial' && user.message_count >= 10) {
-      this.sql.exec(`UPDATE users SET status = 'hooked' WHERE chat_id = ?`, chatId);
+    if (messageCount >= 4) {
+      const messages = this.sql.exec(`SELECT role, content FROM messages WHERE session_id = ? ORDER BY timestamp`, sessionId).toArray();
+      const transcript = messages.map(m => `${m.role}: ${m.content}`).join('\n');
+      
+      const anthropic = new Anthropic({ apiKey: this.env.ANTHROPIC_API_KEY });
+      
+      try {
+        const result = await runExtractions(this.env.MEMORY, anthropic, chatId, transcript, messageCount);
+        console.log(`Extractions for ${chatId}:`, result);
+        this.sql.exec(`UPDATE sessions SET extraction_done = 1 WHERE id = ?`, sessionId);
+      } catch (e) {
+        console.error('Extraction failed:', e);
+      }
     }
   }
 
-  private async closeSession(sessionId: string, chatId: string): Promise<void> {
-    const messages = this.sql.exec(`SELECT role, content FROM messages WHERE session_id = ? ORDER BY timestamp`, sessionId).toArray();
+  private async processStaleExtractions(): Promise<void> {
+    const cutoff = new Date(Date.now() - EXTRACTION_DELAY_MS).toISOString();
     
-    if (messages.length < 2) {
-      this.sql.exec(`UPDATE sessions SET ended_at = ? WHERE id = ?`, new Date().toISOString(), sessionId);
-      return;
-    }
+    const staleSessions = this.sql.exec(`
+      SELECT s.*, u.chat_id as user_chat_id
+      FROM sessions s
+      JOIN users u ON s.chat_id = u.chat_id
+      WHERE s.ended_at IS NOT NULL 
+        AND s.ended_at < ?
+        AND s.extraction_done = 0
+        AND s.message_count >= 4
+      LIMIT 5
+    `, cutoff).toArray();
     
     const anthropic = new Anthropic({ apiKey: this.env.ANTHROPIC_API_KEY });
-    const conversationText = messages.map(m => `${m.role}: ${m.content}`).join('\n');
     
-    const summaryResponse = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 150,
-      messages: [{ role: 'user', content: `Summarize this conversation in 1-2 sentences:\n\n${conversationText}` }]
-    });
-    
-    const summary = summaryResponse.content.find(b => b.type === 'text')?.text || null;
-    this.sql.exec(`UPDATE sessions SET ended_at = ?, summary = ? WHERE id = ?`, new Date().toISOString(), summary, sessionId);
+    for (const session of staleSessions) {
+      const messages = this.sql.exec(`SELECT role, content FROM messages WHERE session_id = ? ORDER BY timestamp`, session.id).toArray();
+      const transcript = messages.map(m => `${m.role}: ${m.content}`).join('\n');
+      
+      try {
+        await runExtractions(this.env.MEMORY, anthropic, session.chat_id as string, transcript, session.message_count as number);
+        this.sql.exec(`UPDATE sessions SET extraction_done = 1 WHERE id = ?`, session.id);
+      } catch (e) {
+        console.error(`Extraction failed for session ${session.id}:`, e);
+      }
+    }
   }
 
   private async checkAllUsersForOutreach(): Promise<void> {
@@ -336,7 +516,7 @@ export class ElliottAgent {
     
     const eligibleUsers = this.sql.exec(`
       SELECT * FROM users 
-      WHERE status IN ('trial', 'hooked', 'active')
+      WHERE status IN ('trial', 'active')
       AND last_message_at < ? AND last_message_at > ?
       AND (last_outreach_at IS NULL OR last_outreach_at < last_message_at)
       LIMIT 10
@@ -348,20 +528,32 @@ export class ElliottAgent {
   }
 
   private async sendProactiveMessage(user: User): Promise<void> {
-    const lastSessionResult = this.sql.exec(`SELECT * FROM sessions WHERE chat_id = ? AND summary IS NOT NULL ORDER BY started_at DESC LIMIT 1`, user.chat_id).toArray();
-    const lastSession = lastSessionResult.length > 0 ? lastSessionResult[0] as Session : null;
-    
     const anthropic = new Anthropic({ apiKey: this.env.ANTHROPIC_API_KEY });
+    const memory = await loadHotMemory(this.env.MEMORY, user.chat_id);
+    const memoryContext = formatMemoryForPrompt(memory);
     
-    const prompt = lastSession?.summary 
-      ? `Based on your last conversation about: "${lastSession.summary}", send a brief, natural check-in to ${user.first_name}.`
-      : `Send a brief, natural check-in message to ${user.first_name}.`;
+    const activeThreads = memory.threads.active_threads.filter(t => {
+      const followUp = new Date(t.follow_up_after);
+      return !t.resolved && followUp <= new Date();
+    });
+    
+    let outreachContext = `\n\n[CONTEXT: It's been a day or two since ${user.first_name} messaged. Send a brief, natural check-in. `;
+    if (activeThreads.length > 0) {
+      outreachContext += `You have something to follow up on: "${activeThreads[0].prompt}"`;
+    } else if (memory.relationship.inside_jokes.length > 0) {
+      outreachContext += `Maybe reference something from your history together.`;
+    } else {
+      outreachContext += `Keep it light and casual.`;
+    }
+    outreachContext += `]`;
+    
+    const systemPrompt = buildPrompt('[proactive outreach]', new Date(), memory.relationship.phase) + memoryContext + outreachContext;
     
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 200,
-      system: SYSTEM_PROMPT + `\n\n${prompt}`,
-      messages: [{ role: 'user', content: '[SYSTEM: Generate proactive outreach]' }]
+      system: systemPrompt,
+      messages: [{ role: 'user', content: '[Send a casual check-in message]' }]
     });
     
     const textBlock = response.content.find(b => b.type === 'text');
@@ -387,7 +579,7 @@ export class ElliottAgent {
     }
     
     const pauseCutoff = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
-    this.sql.exec(`UPDATE users SET status = 'paused' WHERE status IN ('trial', 'hooked', 'active') AND last_message_at < ?`, pauseCutoff);
+    this.sql.exec(`UPDATE users SET status = 'paused' WHERE status IN ('trial', 'active') AND last_message_at < ?`, pauseCutoff);
     this.sql.exec(`UPDATE users SET status = 'churned' WHERE status = 'paused' AND last_message_at < ?`, cutoff);
   }
 
