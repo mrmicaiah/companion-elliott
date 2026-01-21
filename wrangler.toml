@@ -15,6 +15,10 @@ class_name = "ElliottAgent"
 tag = "v1"
 new_sqlite_classes = ["ElliottAgent"]
 
+[vars]
+ACCOUNTS_URL = "https://companion-accounts.micaiah-tasks.workers.dev"
+
 # Secrets (set via Cloudflare dashboard):
 # - ANTHROPIC_API_KEY
 # - TELEGRAM_BOT_TOKEN
+# - TELEGRAM_WEBHOOK_SECRET
